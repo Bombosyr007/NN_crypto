@@ -1,0 +1,62 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# ========== 1. Generate Synthetic Data ==========
+data = np.array([i for i in range(10)])  # Example: 0, 1, 2, ..., 99
+
+def create_sequences(data, input_size=5, target_size=3):
+    X, y = [], []
+    for i in range(len(data) - input_size - target_size):
+        X.append(data[i:i+input_size])
+        y.append(data[i+input_size:i+input_size+target_size])
+    return np.array(X), np.array(y)
+
+input_size = 5
+target_size = 3
+X, y = create_sequences(data, input_size, target_size)
+
+# Convert to PyTorch tensors
+X = torch.tensor(X, dtype=torch.float32)
+y = torch.tensor(y, dtype=torch.float32)
+
+# Dataset and DataLoader
+dataset = TensorDataset(X, y)
+loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+# ========== 2. Define LSTM Model ==========
+class SeqPredictor(nn.Module):
+    def __init__(self, input_dim=1, hidden_size=64, output_size=3):
+        super(SeqPredictor, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        x = x.unsqueeze(-1)  # Add feature dim: (batch, seq_len) → (batch, seq_len, 1)
+        _, (hidden, _) = self.lstm(x)
+        out = self.fc(hidden[-1])  # Use the last hidden state
+        return out
+
+model = SeqPredictor()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ========== 3. Training ==========
+for epoch in range(1300):
+    for batch_X, batch_y in loader:
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+# ========== 4. Prediction ==========
+with torch.no_grad():
+    test_input = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float32).unsqueeze(0)
+    prediction = model(test_input)
+    print("Input: [1, 2, 3, 4, 5]")
+    print("Predicted next sequence:", prediction.numpy().flatten())
