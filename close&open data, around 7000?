@@ -1,0 +1,60 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# ========== 1. Create Dummy Open/Close Data ==========
+data = np.array([[i, i + 0.5] for i in range(100)])  # open = i, close = i+0.5
+
+def create_sequences(data, input_size=5, target_size=3, target_column=1):
+    X, y = [], []
+    for i in range(len(data) - input_size - target_size):
+        X.append(data[i:i+input_size])  # shape: (seq_len, features)
+        y.append(data[i+input_size:i+input_size+target_size, target_column])  # predict close
+    return np.array(X), np.array(y)
+
+input_size = 5
+target_size = 3
+X, y = create_sequences(data, input_size, target_size)
+
+X = torch.tensor(X, dtype=torch.float32)  # shape: (samples, 5, 2)
+y = torch.tensor(y, dtype=torch.float32)  # shape: (samples, 3)
+
+dataset = TensorDataset(X, y)
+loader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+# ========== 2. Model Definition ==========
+class SeqPredictor(nn.Module):
+    def __init__(self, input_dim=2, hidden_size=64, output_size=3):
+        super(SeqPredictor, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        _, (hidden, _) = self.lstm(x)
+        out = self.fc(hidden[-1])
+        return out
+
+model = SeqPredictor()
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ========== 3. Training ==========
+for epoch in range(7000):
+    for batch_X, batch_y in loader:
+        outputs = model(batch_X)
+        loss = criterion(outputs, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+# ========== 4. Prediction ==========
+with torch.no_grad():
+    test_input = torch.tensor([[95, 95.5], [96, 96.5], [97, 97.5], [98, 98.5], [99, 99.5]], dtype=torch.float32)
+    test_input = test_input.unsqueeze(0)  # add batch dimension
+    prediction = model(test_input)
+    print("Input (open/close):", test_input)
+    print("Predicted next close values:", prediction.numpy().flatten())
