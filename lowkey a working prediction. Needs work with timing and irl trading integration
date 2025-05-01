@@ -1,0 +1,135 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+
+# === 1. Load Data from Binance ===
+exchange = ccxt.binance()
+symbol = 'BTC/USDT'
+timeframe = '1h'
+limit = 1000
+ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+# === 2. Add Smart Money Concepts (SMC) Features ===
+df['range'] = df['high'] - df['low']
+df['body'] = abs(df['close'] - df['open'])
+df['volatility'] = df['range'].rolling(5).mean()
+df['momentum'] = df['close'] - df['close'].shift(3)
+df['volume_spike'] = df['volume'] / df['volume'].rolling(10).mean()
+
+# FVG Detection (simple gap between two candles)
+df['fvg'] = ((df['low'].shift(2) > df['high'].shift(0)) | (df['high'].shift(2) < df['low'].shift(0))).astype(int)
+
+# Order Block Proxy (strong down move with high volume and long wicks)
+df['bearish_OB'] = ((df['open'] > df['close']) &
+                    (df['volume'] > df['volume'].rolling(5).mean()) &
+                    ((df['open'] - df['close']) > df['body'].rolling(5).mean())).astype(int)
+
+# Break of Structure: New high or new low
+df['bos_high'] = (df['high'] > df['high'].shift(1).rolling(5).max()).astype(int)
+df['bos_low'] = (df['low'] < df['low'].shift(1).rolling(5).min()).astype(int)
+
+df.dropna(inplace=True)
+
+# === 3. Define Target Classes ===
+future_return = df['close'].shift(-3) / df['close'] - 1
+threshold = 0.002
+target = future_return.apply(lambda x: 2 if x > threshold else (0 if x < -threshold else 1))
+df = df.iloc[:-3]
+target = target.iloc[:-3]
+
+features = ['range', 'body', 'volatility', 'momentum', 'volume_spike', 'fvg', 'bearish_OB', 'bos_high', 'bos_low']
+
+# === 4. Prepare Data ===
+scaler = MinMaxScaler()
+scaled_X = scaler.fit_transform(df[features])
+seq_len = 20
+X, y = [], []
+
+for i in range(len(scaled_X) - seq_len):
+    X.append(scaled_X[i:i+seq_len])
+    y.append(target.values[i+seq_len])
+
+X = torch.tensor(np.array(X), dtype=torch.float32)
+y = torch.tensor(np.array(y), dtype=torch.long)
+dataset = TensorDataset(X, y)
+loader = DataLoader(dataset, batch_size=32, shuffle=False)
+
+# === 5. Build LSTM Model ===
+class CryptoLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
+        super(CryptoLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+model = CryptoLSTM(input_size=X.shape[2])
+loss_fn = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# === 6. Train Model ===
+print("Training started...")
+epochs = 500
+for epoch in range(epochs):
+    total_loss = 0
+    for batch_x, batch_y in loader:
+        optimizer.zero_grad()
+        out = model(batch_x)
+        loss = loss_fn(out, batch_y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss:.4f}")
+
+# === 7. Predict and Evaluate ===
+model.eval()
+with torch.no_grad():
+    preds = model(X).argmax(dim=1).numpy()
+
+true = y.numpy()
+price = df['close'].values[seq_len:]
+
+# === 8. Win Rate Calculation ===
+correct = 0
+trades = 0
+for i in range(len(preds)):
+    if preds[i] == 2 and future_return.values[seq_len+i] > 0:
+        correct += 1
+        trades += 1
+    elif preds[i] == 0 and future_return.values[seq_len+i] < 0:
+        correct += 1
+        trades += 1
+    elif preds[i] == 1:
+        continue  # neutral
+    else:
+        trades += 1
+
+win_rate = correct / trades if trades else 0
+print(f"\n📈 Total Trades: {trades} | ✅ Correct: {correct} | 🎯 Win Rate: {win_rate:.2%}")
+
+# === 9. Plot ===
+longs = np.where(preds == 2)[0]
+shorts = np.where(preds == 0)[0]
+
+plt.figure(figsize=(14, 6))
+plt.plot(price, label='Price', color='black')
+plt.scatter(longs, price[longs], marker='^', color='green', label='Long')
+plt.scatter(shorts, price[shorts], marker='v', color='red', label='Short')
+plt.title('BTC/USDT Predictions with SMC + LSTM')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
