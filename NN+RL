@@ -1,0 +1,197 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, TensorDataset
+import requests
+
+# --- Step 1: Get Binance Data ---
+def fetch_binance(symbol="BTCUSDT", interval="1h", limit=1000):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    return df
+
+# --- Step 2: Feature Engineering ---
+def add_features(df):
+    df["hour"] = df.index.hour
+    df["future_close"] = df["close"].shift(-3)
+    df["target"] = 1 * (df["future_close"] > df["close"]) + 2 * (df["future_close"] < df["close"])
+    df.dropna(inplace=True)
+    return df
+
+# --- Step 3: Preprocess for LSTM ---
+def create_sequences(df, seq_len=24):
+    features = ["open", "high", "low", "close", "volume", "hour"]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+    X, y = [], []
+    for i in range(len(df) - seq_len):
+        X.append(df[features].iloc[i:i + seq_len].values)
+        y.append(df["target"].iloc[i + seq_len - 1])
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(y), dtype=torch.long)
+
+# --- Step 4: Define Model ---
+class LSTMModel(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, 64, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)  # Classes: Neutral, Long, Short
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+# --- Step 5: Define Q-Learning Agent ---
+class QLearningAgent:
+    def __init__(self, input_size, action_space, epsilon=0.1, gamma=0.99, lr=0.001):
+        self.epsilon = epsilon
+        self.gamma = gamma
+        self.lr = lr
+        self.action_space = action_space
+        self.q_table = torch.zeros(input_size, action_space)  # Q-table for state-action pairs
+        self.optimizer = optim.Adam([self.q_table], lr=self.lr)
+
+    def act(self, state):
+        # Convert the state to a long tensor to be used as an index
+        state = state.long()
+
+        # Epsilon-greedy action selection
+        if random.random() < self.epsilon:
+            # Explore: select a random action
+            return random.choice(range(self.action_space))  # Action space is a range of possible actions
+        else:
+            # Exploit: select the action with the highest Q-value for the current state
+            state_idx = torch.argmax(state).item()  # Convert the state vector to an index
+            return torch.argmax(self.q_table[state_idx]).item()  # Return the action with the highest Q-value
+
+    def learn(self, state, action, reward, next_state, done):
+        # Q-learning update rule
+        future_q_value = torch.max(self.q_table[next_state])
+        target = reward + self.gamma * future_q_value * (1 - done)
+        loss = (self.q_table[state][action] - target).pow(2)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+# --- Step 6: Training Loop with Trading Logic ---
+def train(X, y, input_size, epochs=1200, starting_balance=1500):
+    model = LSTMModel(input_size)
+    agent = QLearningAgent(input_size=input_size, action_space=3)  # 3 actions: Buy, Sell, Hold
+    loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    balance = starting_balance
+    open_trade = None  # No trade open at start
+    stop_loss = 0.03  # 3% stop loss
+    take_profit = 0.05  # 5% take profit
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            # Get trade prediction from LSTM
+            action = agent.act(xb[0, -1, :])  # Using the last state in the sequence for action
+
+            # Perform action logic (Buy, Sell, Hold)
+            if action == 1 and open_trade is None:  # Buy
+                open_trade = {"direction": "buy", "price": xb[0, -1, 3]}  # 'buy' direction, store the price
+            elif action == 2 and open_trade is None:  # Sell
+                open_trade = {"direction": "sell", "price": xb[0, -1, 3]}  # 'sell' direction, store the price
+            elif action == 0 and open_trade is not None:  # Hold, Check if it's time to close
+                if open_trade["direction"] == "buy" and (xb[0, -1, 3] - open_trade["price"]) / open_trade["price"] >= take_profit:
+                    balance += balance * take_profit  # Take profit
+                    open_trade = None
+                elif open_trade["direction"] == "buy" and (open_trade["price"] - xb[0, -1, 3]) / open_trade["price"] >= stop_loss:
+                    balance -= balance * stop_loss  # Stop loss
+                    open_trade = None
+                elif open_trade["direction"] == "sell" and (open_trade["price"] - xb[0, -1, 3]) / open_trade["price"] >= take_profit:
+                    balance += balance * take_profit  # Take profit
+                    open_trade = None
+                elif open_trade["direction"] == "sell" and (xb[0, -1, 3] - open_trade["price"]) / open_trade["price"] >= stop_loss:
+                    balance -= balance * stop_loss  # Stop loss
+                    open_trade = None
+
+        print(f"Epoch {epoch + 1}/{epochs} - Loss: {total_loss:.4f}, Balance: {balance:.2f}")
+    return model, agent
+
+# --- Step 7: Evaluate Model ---
+def evaluate_model(model, agent, df, seq_len=24):
+    correct_trades = 0
+    total_trades = 0
+    features = ["open", "high", "low", "close", "volume", "hour"]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+
+    balance = 1500
+    open_trade = None
+    stop_loss = 0.03
+    take_profit = 0.05
+
+    for i in range(len(df) - seq_len - 3):
+        X_seq = df[features].iloc[i:i + seq_len].values
+        future_close = df["close"].iloc[i + seq_len + 2]  # 3 hours ahead
+        current_close = df["close"].iloc[i + seq_len - 1]
+
+        x_tensor = torch.tensor([X_seq], dtype=torch.float32)
+        pred = model(x_tensor)
+        action = agent.act(x_tensor[0, -1, :])  # Get prediction
+
+        # Apply trading logic (Buy, Sell, Hold)
+        if action == 1 and open_trade is None:  # Buy
+            open_trade = {"direction": "buy", "price": x_tensor[0, -1, 3]}
+        elif action == 2 and open_trade is None:  # Sell
+            open_trade = {"direction": "sell", "price": x_tensor[0, -1, 3]}
+        elif action == 0 and open_trade is not None:  # Hold
+            if open_trade["direction"] == "buy" and (x_tensor[0, -1, 3] - open_trade["price"]) / open_trade["price"] >= take_profit:
+                balance += balance * take_profit
+                open_trade = None
+            elif open_trade["direction"] == "buy" and (open_trade["price"] - x_tensor[0, -1, 3]) / open_trade["price"] >= stop_loss:
+                balance -= balance * stop_loss
+                open_trade = None
+            elif open_trade["direction"] == "sell" and (open_trade["price"] - x_tensor[0, -1, 3]) / open_trade["price"] >= take_profit:
+                balance += balance * take_profit
+                open_trade = None
+            elif open_trade["direction"] == "sell" and (x_tensor[0, -1, 3] - open_trade["price"]) / open_trade["price"] >= stop_loss:
+                balance -= balance * stop_loss
+                open_trade = None
+
+        total_trades += 1
+
+    print(f"✅ Trades made: {total_trades}")
+    return balance
+
+# --- Main ---
+if __name__ == "__main__":
+    df = fetch_binance()
+    df = add_features(df)
+    X, y = create_sequences(df)
+    model, agent = train(X, y, X.shape[2], epochs=1200)
+
+    # Evaluate model performance
+    final_balance = evaluate_model(model, agent, df)
+    print(f"💰 Final balance: {final_balance:.2f}")
