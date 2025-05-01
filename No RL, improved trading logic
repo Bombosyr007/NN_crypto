@@ -1,0 +1,195 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, TensorDataset
+import requests
+import matplotlib.pyplot as plt
+from datetime import timedelta
+
+
+# --- Step 1: Get Binance Data ---
+def fetch_binance(symbol="BTCUSDT", interval="1h", limit=1400):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    return df
+
+
+# --- Step 2: Feature Engineering ---
+def add_features(df):
+    df["hour"] = df.index.hour
+    df["future_close"] = df["close"].shift(-3)
+    df["target"] = 1 * (df["future_close"] > df["close"]) + 2 * (df["future_close"] < df["close"])
+    df.dropna(inplace=True)
+    return df
+
+
+# --- Step 3: Preprocess for LSTM ---
+def create_sequences(df, seq_len=24):
+    features = ["open", "high", "low", "close", "volume", "hour"]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+    X, y = [], []
+    for i in range(len(df) - seq_len):
+        X.append(df[features].iloc[i:i + seq_len].values)
+        y.append(df["target"].iloc[i + seq_len - 1])
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(y), dtype=torch.long)
+
+
+# --- Step 4: Define Model ---
+class LSTMModel(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, 64, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)  # Classes: Neutral, Long, Short
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+# --- TRAINING ---
+def train_model(X, y, input_size, epochs=50):
+    model = LSTMModel(input_size)
+    loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{epochs} - Loss: {total_loss:.4f}")
+    return model
+
+
+# --- TRADING: Uses trained model to simulate trading ---
+def simulate_trading(model, df, seq_len=24, starting_balance=1500):
+    features = ["open", "high", "low", "close", "volume", "hour"]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+
+    balance = starting_balance
+    open_trade = None
+    closes = df["close"].values
+    pnl_list = []
+    trade_signals = []
+    prices_for_plot = []
+    trade_log = []  # Log to store trade details
+    successful_trades = 0  # Counter for successful trades
+
+    model.eval()
+    with torch.no_grad():
+        for i in range(len(df) - seq_len - 3):
+            X_seq = df[features].iloc[i:i + seq_len].values
+            raw_close_price = closes[i + seq_len - 1]
+            prices_for_plot.append(raw_close_price)
+
+            x_tensor = torch.tensor(np.array([X_seq]), dtype=torch.float32)
+            logits = model(x_tensor)
+            action = torch.argmax(logits, dim=1).item()  # 0=hold, 1=buy, 2=sell
+
+            if open_trade is None:
+                # Opening a new trade
+                position_size = balance * 0.1
+                if action == 1:  # Buy signal
+                    open_trade = {"direction": "buy", "price": raw_close_price, "timestamp": df.index[i]}
+                    balance -= position_size  # Decrease balance for trade
+                    trade_signals.append(("Buy", i))
+                elif action == 2:  # Sell signal
+                    open_trade = {"direction": "sell", "price": raw_close_price, "timestamp": df.index[i]}
+                    balance -= position_size  # Decrease balance for trade
+                    trade_signals.append(("Sell", i))
+            else:
+                # Closing the trade
+                if (action == 1 and open_trade["direction"] == "sell") or (action == 2 and open_trade["direction"] == "buy"):
+                    old_price = open_trade["price"]
+
+                    if old_price == 0:
+                        continue  # Avoid division by zero
+
+                    # Calculate profit/loss
+                    change = (raw_close_price - old_price) / old_price if open_trade["direction"] == "buy" else (old_price - raw_close_price) / old_price
+
+                    # Ensure change is not NaN or inf
+                    if np.isnan(change) or np.isinf(change):
+                        continue
+
+                    pnl = position_size * change  # Profit/Loss based on position size
+                    pnl_list.append(pnl)
+                    balance += pnl  # Add PnL to balance
+
+                    # Log trade details in simpler format
+                    trade_log.append(f"Trade: {open_trade['direction'].capitalize()} | Open Price: {open_trade['price']:.2f} | Close Price: {raw_close_price:.2f} | PnL: {pnl:.2f}")
+
+                    # Successful trade condition: profit from trade
+                    if pnl > 0:
+                        successful_trades += 1
+
+                    open_trade = {"direction": "buy" if action == 1 else "sell", "price": raw_close_price, "timestamp": df.index[i]}
+                    position_size = balance * 0.1  # Update position size for next trade
+                    balance -= position_size  # Decrease balance for next trade
+                    trade_signals.append(("Buy" if action == 1 else "Sell", i))
+
+    # Print out summary
+    print(f"✅ Total trades: {len(pnl_list)}")
+    print(f"✅ Successful trades: {successful_trades}")
+    print(f"📊 Avg PnL: ${np.mean(pnl_list):.2f}" if pnl_list else "No trades")
+    print(f"💰 Final balance: ${balance:.2f}")
+
+    # Print trade log for debugging
+    print("\nTrade Log:")
+    for trade in trade_log:
+        print(trade)
+
+    # Plotting
+    plt.figure(figsize=(14, 6))
+    plt.plot(prices_for_plot, label="Price")
+    for signal, idx in trade_signals:
+        color = "green" if signal == "Buy" else "red"
+        plt.scatter(idx, prices_for_plot[idx], color=color, marker="^" if signal == "Buy" else "v",
+                    label=signal if idx == trade_signals[0][1] else "")
+    plt.title("Trade Signals")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return balance
+
+
+# --- Main ---
+if __name__ == "__main__":
+    df = fetch_binance()
+    df = add_features(df)
+    X, y = create_sequences(df)
+
+    # Step 1: Train the model
+    model = train_model(X, y, X.shape[2], epochs=1500)
+
+    # Step 2: Simulate trading with the trained model
+    final_balance = simulate_trading(model, df)
+    print(f"Final balance: ${final_balance:.2f}")
