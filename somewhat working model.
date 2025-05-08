@@ -1,0 +1,336 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import random
+import requests
+from collections import deque
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, TensorDataset
+from copy import deepcopy
+import matplotlib.pyplot as plt
+
+
+# Function to fetch Binance Data
+def fetch_binance(symbol="BTCUSDT", interval="1h", limit=1400):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_volume", "taker_buy_quote_volume", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+
+    return df  # ✅ THIS WAS MISSING
+
+# Function to calculate the SMC features
+import numpy as np
+
+def add_smc_features(df, window=14):
+    # Add hour feature based on the index
+    df.loc[:, "hour"] = df.index.hour
+
+    # Future close price shifted by 3 periods
+    df.loc[:, "future_close"] = df["close"].shift(-3)
+
+    # Target: 1 for price up, 2 for price down
+    df.loc[:, "target"] = 1 * (df["future_close"] > df["close"]) + 2 * (df["future_close"] < df["close"])
+
+    # Identify higher highs and lower lows
+    df.loc[:, "HH"] = (df["high"] > df["high"].shift(1)) & (df["high"] > df["high"].shift(-1))
+    df.loc[:, "LL"] = (df["low"] < df["low"].shift(1)) & (df["low"] < df["low"].shift(-1))
+
+    # Identify equal highs and equal lows (close tolerance)
+    df.loc[:, "equal_highs"] = np.isclose(df["high"], df["high"].shift(1), atol=0.1)
+    df.loc[:, "equal_lows"] = np.isclose(df["low"], df["low"].shift(1), atol=0.1)
+
+    # Bullish and bearish order block (OB)
+    df.loc[:, "bullish_OB"] = (df["close"] < df["open"]) & (df["close"].shift(-1) > df["open"].shift(-1))
+    df.loc[:, "bearish_OB"] = (df["close"] > df["open"]) & (df["close"].shift(-1) < df["open"].shift(-1))
+
+    # Fair value gap (FVG) up and down
+    df.loc[:, "fvg_up"] = (df["low"].shift(-1) > df["high"].shift(1))
+    df.loc[:, "fvg_down"] = (df["high"].shift(-1) < df["low"].shift(1))
+
+    # Calculate recent high and low (rolling max and min)
+    df.loc[:, 'recent_high'] = df['close'].rolling(window=window).max()
+    df.loc[:, 'recent_low'] = df['close'].rolling(window=window).min()
+
+    # Calculate premium and discount based on recent high and low
+    df.loc[:, 'premium'] = df['close'] > (df['recent_high'] + df['recent_low']) / 2
+    df.loc[:, 'discount'] = df['close'] < (df['recent_high'] + df['recent_low']) / 2
+
+    return df.copy()  # Ensures all downstream code works on a clean, isolated copy
+
+    # Drop rows with NaN values after the calculations
+    df.dropna(inplace=True)
+
+    return df
+
+# Preprocess data for LSTM
+def create_sequences(df, seq_len=24):
+    features = [
+        "open", "high", "low", "close", "volume", "hour",
+        "HH", "LL", "equal_highs", "equal_lows",
+        "bullish_OB", "bearish_OB", "fvg_up", "fvg_down",
+        "premium", "discount"
+    ]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+    X, y = [], []
+    for i in range(len(df) - seq_len):
+        X.append(df[features].iloc[i:i + seq_len].values)
+        y.append(df["target"].iloc[i + seq_len - 1])
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(y), dtype=torch.long)
+
+# LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, 64, batch_first=True)
+        self.fc = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)  # Classes: Neutral, Long, Short
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+# DQN Agent Class
+class DQNAgent:
+    def __init__(self, state_size, action_size, gamma=0.99, epsilon=1.0, epsilon_min=0.01, epsilon_decay=0.995,
+                 model=None):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.replay_buffer = []
+
+        # Model for Q-network
+        self.model = model if model else self.build_model()
+
+        # Target model (for stabilizing training)
+        self.target_model = deepcopy(self.model)  # Step 2: Initialize target model
+        self.optimizer = optim.Adam(self.model.parameters())  # Optimizer for the Q-network
+
+    def build_model(self):
+        # Define the Q-network model here (assuming a simple MLP model)
+        model = nn.Sequential(
+            nn.Linear(self.state_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.action_size)
+        )
+        return model
+
+    def update_target_network(self):
+        # Step 3: Copy weights from model to target_model
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def act(self, state):
+        # Epsilon-greedy policy
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)  # Exploration
+        else:
+            state_tensor = torch.tensor(state, dtype=torch.float32)
+            q_values = self.model(state_tensor)
+            return torch.argmax(q_values).item()  # Exploitation
+
+    def replay(self, batch_size=32):
+        if len(self.replay_buffer) < batch_size:
+            return
+
+        batch = random.sample(self.replay_buffer, batch_size)
+        for state, action, reward, next_state, done in batch:
+            state_tensor = torch.tensor(state, dtype=torch.float32)
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32)
+            target = reward + (self.gamma * torch.max(self.target_model(next_state_tensor)).item() * (1 - done))
+
+            # Get Q value for the taken action
+            q_values = self.model(state_tensor)
+            q_values[action] = target  # Update Q value for the action taken
+
+            # Backpropagation
+            self.optimizer.zero_grad()
+            loss = nn.MSELoss()(self.model(state_tensor), q_values)
+            loss.backward()
+            self.optimizer.step()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    # Add the train method to call replay
+    def train(self):
+        self.replay()
+
+
+# Simulate trading with DQN and LSTM
+def simulate_trading_with_dqn(model, agent, df, seq_len=24, starting_balance=12500):
+    # Ensure correct preprocessing and sequence creation here
+    features = ["open", "high", "low", "close", "volume", "hour"]
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+
+    balance = starting_balance
+    open_trade = None
+    closes = df["close"].values
+    pnl_list = []
+    trade_signals = []
+    prices_for_plot = []
+    trade_log = []
+    successful_trades = 0
+
+    model.eval()
+
+    for i in range(len(df) - seq_len - 3):
+
+        X_seq = df[features].iloc[i:i + seq_len].values
+        smc_analysis = add_smc_features(df.iloc[i:i + seq_len])
+
+        lstm_predictions = model(torch.tensor(np.array([X_seq]), dtype=torch.float32)).detach().numpy()
+
+        # Ensure that X_seq, smc_analysis, and lstm_predictions are numpy arrays or can be converted into numpy arrays
+        state = np.concatenate([X_seq.flatten(), smc_analysis.to_numpy().flatten(), lstm_predictions.flatten()])
+        state = state.astype(np.float32)  # Explicitly cast the state to float32
+        state = state[:152]  # Ensure that the state is the correct shape for the model
+
+        next_state = np.concatenate([X_seq.flatten(), smc_analysis.to_numpy().flatten(), lstm_predictions.flatten()])
+        next_state = next_state.astype(np.float32)  # Explicitly cast next_state to float32
+        next_state = next_state[:152]  # Ensure next_state is also correct shape
+
+        action = agent.act(state)
+
+        raw_close_price = closes[i + seq_len - 1]
+        prices_for_plot.append(raw_close_price)
+
+        pnl = 0
+
+        # Check if there's no open trade and a trade should be opened
+        if open_trade is None:
+            if action == 1:
+                open_trade = {"direction": "buy", "price": raw_close_price, "timestamp": df.index[i]}
+                trade_signals.append(("Buy", i))
+            elif action == 2:
+                open_trade = {"direction": "sell", "price": raw_close_price, "timestamp": df.index[i]}
+                trade_signals.append(("Sell", i))
+        else:
+            # If a trade is open, and the action is opposite to the current position
+            if (action == 1 and open_trade["direction"] == "sell") or (
+                    action == 2 and open_trade["direction"] == "buy"):
+                old_price = open_trade["price"]
+
+                if old_price != 0:
+                    change = (raw_close_price - old_price) / old_price if open_trade["direction"] == "buy" else \
+                        (old_price - raw_close_price) / old_price
+                else:
+                    change = 0
+
+                position_size = balance * 0.3
+                pnl = position_size * change
+
+                if not np.isnan(pnl) and not np.isinf(pnl):
+                    pnl_list.append(pnl)
+                    balance += pnl
+
+                    if pnl > 0:
+                        successful_trades += 1
+
+                    # ✅ Trade Logging
+                    trade_log.append({
+                        "time": str(df.index[i]),
+                        "action": f"{open_trade['direction'].upper()} ➝ {'BUY' if action == 1 else 'SELL'}",
+                        "price": raw_close_price,
+                        "pnl": pnl,
+                        "balance": balance
+                    })
+                else:
+                    print(f"Invalid PnL encountered: {pnl}, skipping update.")
+
+                # Record new open trade in opposite direction
+                open_trade = {"direction": "buy" if action == 1 else "sell", "price": raw_close_price,
+                              "timestamp": df.index[i]}
+                trade_signals.append(("Buy" if action == 1 else "Sell", i))
+
+        # Default to zero PnL if no trade closed
+        reward = pnl if 'pnl' in locals() else 0
+        next_state = state
+        done = False
+
+        agent.replay_buffer.append((
+            np.array(state, dtype=np.float32),
+            action,
+            reward,
+            np.array(next_state, dtype=np.float32),
+            done
+        ))
+
+        agent.train()
+
+    agent.update_target_network()
+    # 💹 Pretty Trade Log
+    if trade_log:
+        print("\n📘 TRADE LOG")
+        print(f"{'Time':<20} {'Action':<10} {'Price':<10} {'PNL':<10} {'Balance':<10}")
+        print("-" * 60)
+        for log in trade_log:
+            print(
+                f"{log['time']:<20} {log['action']:<10} ${log['price']:<10.2f} ${log['pnl']:<10.2f} ${log['balance']:<10.2f}")
+    else:
+        print("No trades were made.")
+
+    # 📈 Summary
+    print("\n📊 SUMMARY")
+    print(f"{'Total Trades:':<25} {len(pnl_list)}")
+    print(f"{'Successful Trades:':<25} {successful_trades}")
+    print(f"{'Average PnL per Trade:':<25} ${np.mean(pnl_list):.2f}" if pnl_list else "No PnL data.")
+    print(f"{'Final Balance:':<25} ${balance:.2f}")
+
+    if old_price != 0:
+        change = (raw_close_price - old_price) / old_price if open_trade["direction"] == "buy" else (
+                                                                                                            old_price - raw_close_price) / old_price
+    else:
+        change = 0
+
+    position_size = balance * 0.1
+    pnl = position_size * change
+
+    if not np.isnan(pnl) and not np.isinf(pnl):
+        pnl_list.append(pnl)
+        balance += pnl
+
+        # ✅ Add trade to trade_log
+        trade_log.append({
+            "time": str(df.index[i]),
+            "action": f"{open_trade['direction'].upper()} ➝ {('BUY' if action == 1 else 'SELL')}",
+            "price": raw_close_price,
+            "pnl": pnl,
+            "balance": balance
+        })
+    else:
+        print(f"Invalid PnL encountered: {pnl}, skipping update.")
+
+    print(f"✅ Total trades: {len(pnl_list)}")
+    print(f"✅ Successful trades: {successful_trades}")
+    print(f"📊 Avg PnL: ${np.mean(pnl_list):.2f}" if pnl_list else "No trades")
+    print(f"💰 Final balance: ${balance:.2f}")
+    return balance
+
+
+
+if __name__ == "__main__":
+    lstm_model = LSTMModel(input_size=6)  # Input size based on features
+    agent = DQNAgent(state_size=6 * 24 + 5 + 3, action_size=3)  # 16*24 features + SMC + LSTM predictions
+
+    df = fetch_binance()  # Load Binance data
+    df = add_smc_features(df)
+    final_balance = simulate_trading_with_dqn(lstm_model, agent, df)
+    print(f"Final Balance: {final_balance}")
